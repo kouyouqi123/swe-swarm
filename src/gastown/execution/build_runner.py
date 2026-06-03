@@ -3,6 +3,7 @@ Build runner for executing shell commands.
 """
 
 import asyncio
+import os
 
 from loguru import logger
 
@@ -37,11 +38,43 @@ class BuildResult:
         return f"<BuildResult success={self.success} return_code={self.return_code}>"
 
 
+DANGEROUS_COMMANDS = {
+    "rm", "mkfs", "dd", "format", "shutdown", "reboot", "halt",
+    "poweroff", "init", "killall", "pkill", "chmod", "chown",
+    "mount", "umount", "fdisk", "parted", "mkswap",
+}
+
+
 class BuildRunner:
-    """Runs shell commands for building, installing, etc."""
+    """Runs shell commands for building, installing, etc.
+
+    SECURITY NOTE: This runner performs NO sandboxing of its own.
+    In production, commands MUST be validated against an allowlist and
+    executed inside an isolated container (Docker/gVisor/Firecracker).
+    The basic command validation below is ONLY a safety net against
+    accidental dangerous commands, not a security boundary.
+    """
 
     def __init__(self, working_dir: str = "."):
         self.working_dir = working_dir
+
+    @staticmethod
+    def _validate_command(command: str) -> str | None:
+        """Basic safety-net validation: block known dangerous commands.
+
+        This is NOT a security boundary — it's a best-effort guard against
+        accidental destructive operations. Real sandboxing requires OS-level
+        isolation (containers, seccomp, landlock, etc.).
+        """
+        base = os.path.basename(command)
+        if base in DANGEROUS_COMMANDS:
+            return f"Command '{command}' is blocked by safety validation"
+        # Block shell metacharacters that could enable argument injection
+        dangerous_chars = {"|", ";", "&", "$", "`", "(", ")", "{", "}", "<", ">"}
+        for char in dangerous_chars:
+            if char in command:
+                return f"Command contains dangerous shell metacharacter '{char}'"
+        return None
 
     async def run_command(
         self,
@@ -51,7 +84,18 @@ class BuildRunner:
         timeout: float = 300.0,  # 5 minutes
     ) -> BuildResult:
         """Run a shell command and return result."""
-        import os
+        # Basic command validation safety net
+        validation_error = self._validate_command(command)
+        if validation_error:
+            logger.warning(f"Blocked dangerous command '{command}': {validation_error}")
+            return BuildResult(
+                success=False,
+                return_code=-1,
+                stdout="",
+                stderr=validation_error,
+                duration=0.0,
+            )
+
         import time
 
         start_time = time.time()
