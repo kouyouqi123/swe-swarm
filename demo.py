@@ -7,7 +7,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from loguru import logger
-from src.gastown.demo_orchestrator import DemoOrchestrator
+from gastown.demo_orchestrator import DemoOrchestrator
 
 
 async def main():
