@@ -1,8 +1,14 @@
 """
 Test runner for executing pytest.
+
+SECURITY NOTE: This runner performs NO sandboxing of its own.
+In production, pytest commands MUST be validated and executed
+inside an isolated container. The basic validation below is
+ONLY a safety net against accidental dangerous operations.
 """
 
 import asyncio
+import os
 import re
 from pathlib import Path
 
@@ -54,18 +60,48 @@ class TestRunResult:
         )
 
 
+DANGEROUS_COMMANDS = {
+    "rm", "mkfs", "dd", "format", "shutdown", "reboot", "halt",
+    "poweroff", "init", "killall", "pkill", "chmod", "chown",
+    "mount", "umount", "fdisk", "parted", "mkswap",
+}
+
+
 class TestRunner:
-    """Runs pytest on a given directory."""
+    """Runs pytest on a given directory.
+
+    SECURITY NOTE: This runner performs NO sandboxing of its own.
+    In production, commands MUST be validated against an allowlist and
+    executed inside an isolated container (Docker/gVisor/Firecracker).
+    The basic command validation below is ONLY a safety net against
+    accidental dangerous commands, not a security boundary.
+    """
 
     def __init__(self, test_dir: str = ".", python_path: str = "python"):
         self.test_dir = Path(test_dir)
         self.python_path = python_path
+
+    @staticmethod
+    def _validate_command(cmd: list[str]) -> str | None:
+        """Basic safety-net validation for the command list."""
+        # Check the python path
+        base = os.path.basename(cmd[0]) if cmd else ""
+        if base in DANGEROUS_COMMANDS:
+            return f"Command '{base}' is blocked by safety validation"
+        # Check each arg for dangerous shell metacharacters
+        dangerous_chars = {"|", ";", "&", "$", "`", "(", ")", "{", "}", "<", ">"}
+        for arg in cmd:
+            for char in dangerous_chars:
+                if char in arg:
+                    return f"Argument contains dangerous shell metacharacter '{char}'"
+        return None
 
     async def run_tests(
         self,
         test_path: str | None = None,
         verbose: bool = False,
         extra_args: list[str] = None,
+        timeout: float = 300.0,
     ) -> TestRunResult:
         """Run pytest and return results."""
         import time
@@ -78,10 +114,25 @@ class TestRunner:
             cmd.append("-v")
         if test_path:
             cmd.append(test_path)
-        # If no test_path, pytest will default to current directory (cwd)
 
         if extra_args:
             cmd.extend(extra_args)
+
+        # Basic command validation safety net
+        validation_error = self._validate_command(cmd)
+        if validation_error:
+            logger.warning(f"Blocked dangerous command: {validation_error}")
+            return TestRunResult(
+                success=False,
+                return_code=-1,
+                total=0,
+                passed=0,
+                failed=0,
+                errors=1,
+                skipped=0,
+                output=validation_error,
+                duration=0.0,
+            )
 
         logger.debug(f"Running test command: {' '.join(cmd)}")
 
@@ -94,10 +145,28 @@ class TestRunner:
                 cwd=str(self.test_dir),
             )
 
-            stdout, _ = await process.communicate()
-            output = stdout.decode()
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout
+                )
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                return TestRunResult(
+                    success=False,
+                    return_code=-1,
+                    total=0,
+                    passed=0,
+                    failed=0,
+                    errors=1,
+                    skipped=0,
+                    output=f"Tests timed out after {timeout} seconds",
+                    duration=time.time() - start_time,
+                )
 
             duration = time.time() - start_time
+
+            output = stdout.decode()
 
             # Parse pytest output (simplified)
             # In production, use pytest's JSON output plugin
